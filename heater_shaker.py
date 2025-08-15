@@ -75,7 +75,7 @@ class HHSCommands:
     USB_PRODUCT_ID = 0x8002   # Heater Shaker product ID
     
     @staticmethod
-    def build_command(index: int, command: str, command_id: int, **kwargs) -> str:
+    def build_command(index: int, command: str, command_id: int, interface_type: str = "usb", **kwargs) -> str:
         """
         Build Hamilton HHS command string.
         
@@ -83,18 +83,24 @@ class HHSCommands:
             index: Device index (1-8 for box, 1-2 for STAR)
             command: Command code (TA, SB, SC, etc.)
             command_id: Unique command ID
+            interface_type: "usb" (includes T{index} prefix) or "rs232" (no prefix)
             **kwargs: Command arguments
             
         Returns:
             Complete command string
             
         Examples:
-            build_command(1, "TA", 123, ta="0370") -> "T1TAid0123ta0370"  # 37.0°C
-            build_command(1, "SB", 124, st=0, sv="0800", sr="01000") -> "T1SBid0124st0sv0800sr01000"
+            USB: build_command(1, "TA", 123, "usb", ta="0370") -> "T1TAid0123ta0370"
+            RS232: build_command(1, "TA", 123, "rs232", ta="0370") -> "TAid0123ta0370"
         """
         args = "".join([f"{key}{value}" for key, value in kwargs.items()])
         id_str = str(command_id).zfill(4)
-        return f"T{index}{command}id{id_str}{args}"
+        
+        # Only include T{index} prefix for USB box control (not for STAR RS232)
+        if interface_type == "usb":
+            return f"T{index}{command}id{id_str}{args}"
+        else:
+            return f"{command}id{id_str}{args}"
     
     @staticmethod
     def format_temperature(temp_celsius: float) -> str:
@@ -102,9 +108,9 @@ class HHSCommands:
         return f"{round(10 * temp_celsius):04d}"
     
     @staticmethod
-    def format_speed(speed_steps_per_sec: int) -> str:
+    def format_speed(speed_increments_per_sec: int) -> str:
         """Format speed for Hamilton protocol (4-digit zero-padded)."""
-        return f"{speed_steps_per_sec:04d}"
+        return f"{speed_increments_per_sec:04d}"
     
     @staticmethod
     def format_acceleration(accel: int) -> str:
@@ -116,24 +122,36 @@ class HHSCommands:
         """
         Parse Hamilton temperature response.
         
-        Response format: "...rt+0370 +0365..." (middle temp, edge temp in tenths of degrees)
+        Response format: "...er00rt+0370 +0365..." or "...rt+0370 +0365..."
+        (middle temp, edge temp in tenths of degrees)
         """
         result = {'middle': None, 'edge': None, 'success': False}
         
         try:
+            # Find the temperature data after 'rt'
             if 'rt' in response:
                 temp_part = response.split('rt')[1]
                 temps = temp_part.split()
                 
                 if len(temps) >= 2:
-                    middle_temp = float(temps[0].strip('+')) / 10
-                    edge_temp = float(temps[1].strip('+')) / 10
+                    # Remove any leading '+' or other characters and convert
+                    middle_str = temps[0].strip('+').strip()
+                    edge_str = temps[1].strip('+').strip()
                     
-                    result.update({
-                        'middle': middle_temp,
-                        'edge': edge_temp,
-                        'success': True
-                    })
+                    # Extract numeric part only
+                    import re
+                    middle_match = re.search(r'[+-]?\d+', middle_str)
+                    edge_match = re.search(r'[+-]?\d+', edge_str)
+                    
+                    if middle_match and edge_match:
+                        middle_temp = float(middle_match.group()) / 10
+                        edge_temp = float(edge_match.group()) / 10
+                        
+                        result.update({
+                            'middle': middle_temp,
+                            'edge': edge_temp,
+                            'success': True
+                        })
         except Exception as e:
             result['error'] = f"Parse error: {e}"
         
@@ -141,13 +159,22 @@ class HHSCommands:
     
     @staticmethod
     def parse_shaking_response(response: str) -> bool:
-        """Parse shaking status response (returns True if shaking)."""
-        return response.endswith("1")
+        """Parse shaking status response (RD command returns rd0 or rd1)."""
+        # Look for rd0 (not moving) or rd1 (moving) pattern
+        if 'rd0' in response:
+            return False
+        elif 'rd1' in response:
+            return True
+        else:
+            # If neither pattern found, assume not shaking
+            return False
     
     @staticmethod
     def parse_response(response: str) -> dict:
         """
-        Parse general Hamilton HHS response string.
+        Parse Hamilton HHS response string according to official manual.
+        
+        Format: [Command]id[id]er[error_code][data]
         
         Returns:
             Dictionary with parsed response data
@@ -155,6 +182,7 @@ class HHSCommands:
         result = {
             'success': False,
             'command_id': None,
+            'error_code': None,
             'data': {},
             'error': None,
             'raw_response': response
@@ -171,9 +199,21 @@ class HHSCommands:
                 if id_start + 4 <= len(response):
                     result['command_id'] = response[id_start:id_start+4]
             
-            # Most Hamilton responses are successful if we get a response
-            # Specific error handling would need more protocol analysis
-            if response and len(response) > 0:
+            # Extract error code (Hamilton manual: er## format)
+            if 'er' in response:
+                er_start = response.find('er') + 2
+                if er_start + 2 <= len(response):
+                    error_code = response[er_start:er_start+2]
+                    result['error_code'] = error_code
+                    
+                    # Error code 00 means success
+                    if error_code == "00":
+                        result['success'] = True
+                    else:
+                        result['success'] = False
+                        result['error'] = f"Hamilton error code: {error_code}"
+            else:
+                # If no error code found, assume success if we got a response
                 result['success'] = True
                 
         except Exception as e:
@@ -294,8 +334,30 @@ class USBInterface:
             
             # Set configuration
             self.device.set_configuration()
+            
+            # Find bulk endpoints instead of hard-coding
+            cfg = self.device.get_active_configuration()
+            intf = cfg[(0, 0)]
+            
+            # Find first OUT and IN bulk endpoints
+            self.out_endpoint = None
+            self.in_endpoint = None
+            
+            for ep in intf:
+                if usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_OUT:
+                    if usb.util.endpoint_type(ep.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK:
+                        self.out_endpoint = ep.bEndpointAddress
+                elif usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_IN:
+                    if usb.util.endpoint_type(ep.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK:
+                        self.in_endpoint = ep.bEndpointAddress
+            
+            if not (self.out_endpoint and self.in_endpoint):
+                logging.error("Could not find bulk endpoints")
+                return False
+            
             self.is_connected = True
             logging.info(f"Connected to USB device {self.vendor_id:04X}:{self.product_id:04X}")
+            logging.info(f"Using endpoints OUT: {self.out_endpoint:02X}, IN: {self.in_endpoint:02X}")
             return True
             
         except Exception as e:
@@ -320,17 +382,13 @@ class USBInterface:
             raise ConnectionError("Not connected to USB device")
         
         try:
-            # USB endpoint configuration (typical values)
-            out_endpoint = 0x02
-            in_endpoint = 0x81
-            
-            # Send command as ASCII string
+            # Use discovered endpoints instead of hard-coded values
             command_bytes = (command + '\r\n').encode('ascii')
-            self.device.write(out_endpoint, command_bytes)
+            self.device.write(self.out_endpoint, command_bytes)
             logging.debug(f"USB sent: {command}")
             
             # Read response
-            response_bytes = self.device.read(in_endpoint, 64, timeout=2000)
+            response_bytes = self.device.read(self.in_endpoint, 64, timeout=2000)
             response = bytes(response_bytes).decode('ascii').strip()
             logging.debug(f"USB received: {response}")
             
@@ -371,14 +429,15 @@ class HeaterShaker:
         # Communication interface
         self.comm_interface = None
         self.is_initialized = False
+        self.is_connected = False     # Initialize connection state
         
-        # Device specifications (from PyLabRobot analysis)
-        self.max_temperature = 105.0  # °C
-        self.min_temperature = 0.1    # °C (must be > 0)
-        self.max_speed = 2000         # steps/second (from PyLabRobot: 20-2000)
-        self.min_speed = 20           # steps/second
-        self.min_acceleration = 500   # increments/second
-        self.max_acceleration = 10000 # increments/second
+        # Device specifications (from Hamilton Manual E289247a)
+        self.max_temperature = 115.0  # °C (Manual: 0000..1150 = 0-115°C)
+        self.min_temperature = 0.0    # °C (Manual allows 0°C)
+        self.max_speed = 2000         # increments/second (Manual: 0020..2000)
+        self.min_speed = 20           # increments/second
+        self.min_acceleration = 500   # increments/second² (Manual: 00500..10000)
+        self.max_acceleration = 10000 # increments/second²
         
         # Current state
         self.current_temperature = None
@@ -425,6 +484,22 @@ class HeaterShaker:
         """Synchronous wrapper for stop_shaking."""
         return self._run_async(self.stop_shaking_async())
     
+    def wait_for_temperature(self) -> bool:
+        """Synchronous wrapper for wait_for_temperature."""
+        return self._run_async(self.wait_for_temperature_async())
+    
+    def get_temperature_controller_state(self) -> Optional[dict]:
+        """Synchronous wrapper for get_temperature_controller_state."""
+        return self._run_async(self.get_temperature_controller_state_async())
+    
+    def get_temperature_error(self) -> Optional[str]:
+        """Synchronous wrapper for get_temperature_error."""
+        return self._run_async(self.get_temperature_error_async())
+    
+    def get_heating_state(self) -> Optional[bool]:
+        """Synchronous wrapper for get_heating_state."""
+        return self._run_async(self.get_heating_state_async())
+    
     def shutdown(self) -> bool:
         """Synchronous wrapper for shutdown."""
         result = self._run_async(self.shutdown_async())
@@ -451,15 +526,16 @@ class HeaterShaker:
         Returns:
             Parsed response dictionary
         """
-        if not self.is_initialized:
-            raise RuntimeError("Device not initialized")
+        if not self.is_connected:
+            raise RuntimeError("Device not connected")
         
-        # Build command string
+        # Build command string with proper addressing
         cmd_id = self._generate_command_id()
         cmd_str = HHSCommands.build_command(
             index=self.device_index,
             command=command,
             command_id=cmd_id,
+            interface_type=self.interface.value,  # "usb" or "rs232"
             **kwargs
         )
         
@@ -496,6 +572,8 @@ class HeaterShaker:
             if not await self.comm_interface.connect():
                 raise ConnectionError("Failed to connect to device")
             
+            self.is_connected = True  # Set connected state before sending commands
+            
             # Initialize device systems (from PyLabRobot)
             if not await self._initialize_lock():
                 raise RuntimeError("Failed to initialize lock system")
@@ -514,6 +592,7 @@ class HeaterShaker:
         except Exception as e:
             self.logger.error(f"Initialization failed: {e}")
             self.is_initialized = False
+            self.is_connected = False
             return False
     
     async def heat_shake_async(self, 
@@ -654,7 +733,9 @@ class HeaterShaker:
         accel_str = HHSCommands.format_acceleration(acceleration)
         
         # First ensure plate is locked
-        await self.lock_plate()
+        if not await self.lock_plate():
+            self.logger.error("Failed to lock plate - cannot start shaking")
+            return False
         
         # Start shaking with Hamilton SB command
         response = await self._send_hhs_command(
@@ -731,6 +812,101 @@ class HeaterShaker:
         self.logger.error("Failed to unlock plate")
         return False
     
+    async def wait_for_temperature_async(self) -> bool:
+        """Wait until target temperature is reached (TW command)."""
+        response = await self._send_hhs_command("TW")
+        
+        if response['success']:
+            self.logger.info("Temperature target reached")
+            return True
+        else:
+            # Handle specific temperature errors from manual
+            error_code = response.get('error_code', 'Unknown')
+            if error_code == "61":
+                self.logger.error("Temperature timeout - target not reached in time")
+            elif error_code == "62":
+                self.logger.error("Temperature out of supervision range")
+            elif error_code == "63":
+                self.logger.error("Temperature out of security range - heating disabled")
+            elif error_code == "64":
+                self.logger.error("Temperature sensor error - no connection to sensors or sensor difference too big")
+            else:
+                self.logger.error(f"Temperature wait failed: {response.get('error', 'Unknown error')}")
+            return False
+    
+    async def start_temperature_with_wait(self, temperature: float, **kwargs) -> bool:
+        """Start temperature controller and wait for target (TB command)."""
+        self._validate_temperature(temperature)
+        
+        temp_str = HHSCommands.format_temperature(temperature)
+        
+        response = await self._send_hhs_command(
+            "TB",  # Start temperature with wait
+            ta=temp_str,
+            **kwargs
+        )
+        
+        if response['success']:
+            self.logger.info(f"Temperature reached {temperature}°C")
+            return True
+        else:
+            error_code = response.get('error_code', 'Unknown')
+            if error_code == "61":
+                self.logger.error("Temperature timeout during startup")
+            elif error_code == "62":
+                self.logger.error("Temperature supervision failed")
+            elif error_code == "63":
+                self.logger.error("Temperature security range violation")
+            elif error_code == "64":
+                self.logger.error("Temperature sensor error - no connection to sensors or sensor difference too big")
+            else:
+                self.logger.error(f"Temperature control failed: {response.get('error', 'Unknown error')}")
+            return False
+    
+    async def get_temperature_controller_state_async(self) -> Optional[dict]:
+        """Get temperature controller state (QC command)."""
+        response = await self._send_hhs_command("QC")
+        
+        if response['success']:
+            try:
+                # Parse QC response: look for 'qc' token followed by three values
+                # Format: ...er00qc1 128 0 (control_state pwm_value supervision_state)
+                if 'qc' in response['raw_response']:
+                    qc_part = response['raw_response'].split('qc')[1]
+                    parts = qc_part.split()
+                    
+                    if len(parts) >= 3:
+                        return {
+                            'control_active': parts[0] == '1',
+                            'pwm_value': int(parts[1]),
+                            'supervision_state': int(parts[2])
+                        }
+            except Exception as e:
+                self.logger.error(f"Error parsing controller state: {e}")
+        
+        return None
+    
+    async def get_temperature_error_async(self) -> Optional[str]:
+        """Get last temperature error code (QE command)."""
+        response = await self._send_hhs_command("QE")
+        
+        if response['success']:
+            # Extract error code from qe## response
+            if 'qe' in response['raw_response']:
+                error_code = response['raw_response'].split('qe')[1][:2]
+                return error_code
+        
+        return None
+    
+    async def get_heating_state_async(self) -> Optional[bool]:
+        """Get heating up state (QD command)."""
+        response = await self._send_hhs_command("QD")
+        
+        if response['success']:
+            return 'qd1' in response['raw_response']
+        
+        return None
+    
     async def deactivate_heating(self) -> bool:
         """Turn off heating (Hamilton TO command)."""
         response = await self._send_hhs_command(HHSCommands.DEACTIVATE_HEATING)
@@ -778,9 +954,9 @@ class HeaterShaker:
             raise ValueError(f"Temperature must be between {self.min_temperature}°C and {self.max_temperature}°C")
     
     def _validate_speed(self, speed: float):
-        """Validate speed parameter (steps/second)."""
+        """Validate speed parameter (increments/second per Hamilton manual)."""
         if not (self.min_speed <= speed <= self.max_speed):
-            raise ValueError(f"Speed must be between {self.min_speed} and {self.max_speed} steps/second")
+            raise ValueError(f"Speed must be between {self.min_speed} and {self.max_speed} increments/second")
     
     def _validate_acceleration(self, acceleration: int):
         """Validate acceleration parameter."""
