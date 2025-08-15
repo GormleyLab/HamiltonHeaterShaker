@@ -111,7 +111,7 @@ hs.unlock_plate()
 
 ### Device Specifications
 
-- **Temperature Range**: 0.1°C to 105°C
+- **Temperature Range**: 0.0°C to 115°C
 - **Shaking Speed**: 20 to 2000 steps/second
 - **Acceleration**: 500 to 10000 increments/second
 

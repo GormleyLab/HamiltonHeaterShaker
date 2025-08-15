@@ -69,7 +69,7 @@ The implementation uses authentic Hamilton HHS commands extracted from PyLabRobo
 
 ### Device Specifications
 
-- Temperature: 0.1°C to 105°C
+- Temperature: 0.0°C to 115°C (Hamilton Manual E289247a: 0000..1150 = 0-115°C)
 - Speed: 20 to 2000 steps/second  
 - Acceleration: 500 to 10000 increments/second
 - Multi-device support: 1-8 devices per box, 1-2 per STAR
